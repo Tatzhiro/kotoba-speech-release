@@ -12,6 +12,7 @@ from huggingface_hub import snapshot_download
 from fam.llm.adapters import FlattenedInterleavedEncodec2Codebook
 from fam.llm.decoders import EncodecDecoder
 from fam.llm.fast_inference_utils import build_model, main
+from fam.llm.partial_speech import partial_speech_main
 from fam.llm.inference import (
     EncodecDecoder,
     InferenceConfig,
@@ -65,12 +66,14 @@ class TTS:
             output_dir=self.output_dir,
         )
         data_adapter_second_stage = TiltedEncodec(end_of_audio_token=1024)
+        # kotoba-speech
         self.llm_second_stage = Model(
             config_second_stage, TrainedBPETokeniser, EncodecDecoder, data_adapter_fn=data_adapter_second_stage.decode
         )
         self.enhancer = get_enhancer("df")
 
         self.precision = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self._dtype]
+        # first stage LLM
         self.model, self.tokenizer, self.smodel, self.model_size = build_model(
             precision=self.precision,
             checkpoint_path=Path(f"{self._other_model_dir}/first_stage.pt"),
@@ -144,7 +147,93 @@ class TTS:
         print(f"Real-time factor: {time_to_synth_s / duration_s:.2f}")
 
         return str(wav_file) + ".wav"
+    
+    
+    def synthesise_from_text_and_partial_speech(self, text: str, spk_ref_path: str, init_audo_path: str, top_p=0.95, guidance_scale=3.0, temperature=1.0) -> str:
+        text = normalize_text(text)
+        spk_ref_path = get_cached_file(spk_ref_path)
+        
+        input_audio_token = self.llm_second_stage.decoder.get_tokens(init_audo_path)
+        input_audio_token = torch.tensor(input_audio_token, dtype=torch.int32, device=self._device)
+        
+        check_audio_file(spk_ref_path)
+        spk_emb = get_cached_embedding(
+            spk_ref_path,
+            self.smodel,
+        ).to(device=self._device, dtype=self.precision)
+
+        start = time.time()
+        # first stage LLM
+        tokens = partial_speech_main(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            model_size=self.model_size,
+            prompt=text,
+            spk_emb=spk_emb,
+            top_p=torch.tensor(top_p, device=self._device, dtype=self.precision),
+            guidance_scale=torch.tensor(guidance_scale, device=self._device, dtype=self.precision),
+            temperature=torch.tensor(temperature, device=self._device, dtype=self.precision),
+            # first two layers
+            input_audio_token=input_audio_token[0:2]
+        )
+        text_ids, extracted_audio_ids = self.first_stage_adapter.decode([tokens])
+
+        b_speaker_embs = spk_emb.unsqueeze(0)
+
+        input_audio_token_len = input_audio_token.shape[1]
+        # second stage LLM + multi-band diffusion model (partial speech continuation)
+        wav_files = self.llm_second_stage(
+            texts=[text],
+            encodec_tokens=[torch.tensor(extracted_audio_ids, dtype=torch.int32, device=self._device).unsqueeze(0)],
+            speaker_embs=b_speaker_embs,
+            batch_size=1,
+            guidance_scale=None,
+            top_p=None,
+            top_k=200,
+            temperature=1.0,
+            max_new_tokens=None,
+            partial_speech_token_len=input_audio_token_len
+        )
+
+        # enhance using deepfilternet
+        wav_file = wav_files[0]
+        with tempfile.NamedTemporaryFile(suffix=".wav") as enhanced_tmp:
+            self.enhancer(str(wav_file) + ".wav", enhanced_tmp.name)
+            shutil.copy2(enhanced_tmp.name, str(wav_file) + ".wav")
+            print(f"\nSaved audio to {wav_file}.wav")
+            
+        # second stage LLM + multi-band diffusion model (full speech synthesis)
+        wav_files = self.llm_second_stage(
+            texts=[text],
+            encodec_tokens=[torch.tensor(extracted_audio_ids, dtype=torch.int32, device=self._device).unsqueeze(0)],
+            speaker_embs=b_speaker_embs,
+            batch_size=1,
+            guidance_scale=None,
+            top_p=None,
+            top_k=200,
+            temperature=1.0,
+            max_new_tokens=None,
+            partial_speech_token_len=None
+        )
+
+        # enhance using deepfilternet
+        wav_file = wav_files[0]
+        with tempfile.NamedTemporaryFile(suffix=".wav") as enhanced_tmp:
+            self.enhancer(str(wav_file) + ".wav", enhanced_tmp.name)
+            shutil.copy2(enhanced_tmp.name, str(wav_file) + ".wav")
+            print(f"\nSaved audio to {wav_file}.wav")
+
+        # calculating real-time factor (RTF)
+        time_to_synth_s = time.time() - start
+        audio, sr = librosa.load(str(wav_file) + ".wav")
+        duration_s = librosa.get_duration(y=audio, sr=sr)
+        print(f"\nTotal time to synth (s): {time_to_synth_s}")
+        print(f"Real-time factor: {time_to_synth_s / duration_s:.2f}")
+
+        return str(wav_file) + ".wav"
 
 
 if __name__ == "__main__":
-    tts = tyro.cli(TTS)
+    tts = TTS()
+    # tts.synthesise(text="私は猫が好きで、二匹飼っています。", spk_ref_path="assets/bria.mp3")
+    tts.synthesise_from_text_and_partial_speech(text="私は猫とかが好きで、二匹飼っています。", spk_ref_path="assets/bria.mp3", init_audo_path="assets/input_私は猫.wav")
