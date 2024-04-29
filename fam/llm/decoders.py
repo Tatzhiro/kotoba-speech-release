@@ -62,13 +62,17 @@ class EncodecDecoder(Decoder):
         return tokens.tolist()
 
     def decode(
-        self, tokens: list[list[int]], causal: bool = True, ref_audio_path: Optional[str] = None
+        self, tokens: list[list[int]], causal: bool = True, ref_audio_path: Optional[str] = None, partial_speech_token_len: Optional[int] = None
     ) -> Union[str, torch.Tensor]:
         # TODO: this has strange behaviour -- if causal is True, it returns tokens. if causal is False, it SAVES the audio file.
         text_ids, extracted_audio_ids = self._data_adapter_fn(tokens)
         text = self.tokeniser_decode_fn(text_ids)
         print(f"Text: {text}")
 
+        if partial_speech_token_len is not None:
+            # remove first `partial_speech_token_len` tokens from the extracted_audio_ids
+            extracted_audio_ids = [x[partial_speech_token_len:] for x in extracted_audio_ids]
+            
         tokens = torch.tensor(extracted_audio_ids, device="cuda").unsqueeze(0)
 
         if tokens.shape[1] < self._num_codebooks:
@@ -90,7 +94,10 @@ class EncodecDecoder(Decoder):
             raise Exception("wav predicted is shorter than 400ms!")
 
         try:
-            wav_file_name = self.output_dir / f"synth_{text.replace(' ', '_')[:25]}_{uuid.uuid4()}"
+            if partial_speech_token_len is not None:
+                wav_file_name = self.output_dir / f"continuation_synth_{text.replace(' ', '_')[:25]}_{uuid.uuid4()}"
+            else:
+                wav_file_name = self.output_dir / f"synth_{text.replace(' ', '_')[:25]}_{uuid.uuid4()}"
             self._save_audio(wav_file_name, wav)
             print(f"\nSaved audio to {wav_file_name}.wav")
             return wav_file_name

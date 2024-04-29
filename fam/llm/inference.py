@@ -51,7 +51,7 @@ class Model:
         self,
         config: InferenceConfig,
         tokenizer_cls: Type[TrainedBPETokeniser],
-        decoder_cls: Type[Decoder],
+        decoder_cls: Type[EncodecDecoder],
         data_adapter_fn,
         use_kv_cache: Optional[Literal["vanilla"]] = None,
     ):
@@ -250,6 +250,7 @@ class Model:
         top_k: Optional[int],
         temperature: Optional[float],
         speaker_embs: Optional[torch.Tensor] = None,
+        partial_speech_token_len: Optional[int] = None,
     ) -> list[str]:
         """
         Returns paths to saved audio files.
@@ -310,6 +311,8 @@ class Model:
             with self._ctx:  # type: ignore
                 to_return = []
                 for k in range(self.config.num_samples):
+                    # kotoba-speech model
+                    # generates remaining 6 layers of tokens
                     y = self.model.generate(
                         in_x,
                         None,
@@ -325,7 +328,8 @@ class Model:
                     b_tokens = torch.cat([in_x, y], dim=1)
                     for tokens in b_tokens:
                         try:
-                            to_return.append(self.decoder.decode(tokens=tokens.tolist(), causal=False))
+                            # EncodecDecoder.decode()
+                            to_return.append(self.decoder.decode(tokens=tokens.tolist(), causal=False, partial_speech_token_len=partial_speech_token_len))
                         except Exception as e:
                             print("failed to run MBD.")
                             print(f"reason: {str(e)}")
@@ -343,8 +347,10 @@ class Model:
         top_p: Optional[float],
         temperature: Optional[float],
         encodec_tokens: Optional[list[torch.Tensor]] = None,
+        partial_speech_token_len: Optional[int] = None,
         speaker_embs: Optional[torch.Tensor] = None,
         guidance_scale: Optional[float] = None,
+        
     ):
         if self.checkpoint_config.get("causal", True):
             return self.causal_sample(
@@ -370,6 +376,7 @@ class Model:
                 speaker_embs=speaker_embs,
                 top_k=top_k,
                 temperature=temperature,
+                partial_speech_token_len=partial_speech_token_len
             )
 
 
